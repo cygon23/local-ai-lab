@@ -9,7 +9,7 @@
 | Semantic search | ❌ | ✅ ChromaDB vector search |
 | Source transparency | ❌ | ✅ Shows which chunks were retrieved |
 | Grounded answers | ❌ | ✅ Cites document sources |
-
+.
 ## Setup
 
 ```bash
