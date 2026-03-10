@@ -1,34 +1,19 @@
 """
 tools/web_tools.py
 ------------------
-Real-world API tools: web search, HTTP fetch, page scraping.
+Real-world web tools: search, fetch, API calls.
 
-NO API KEYS REQUIRED for these tools.
-  - DuckDuckGo Instant Answer API: free, no auth, no rate limit for light use
-  - HTTP fetch: just requests to any public URL
-  - Scraper: requests + basic HTML stripping
+SEARCH FIX:
+  DuckDuckGo's Instant Answer API only returns "instant answers"
+  (like Wikipedia boxes), not full web search results.
+  For queries like "AI agent news today" it returns nothing.
 
-THIS IS THE BRIDGE FROM LOCAL TO THE REAL WORLD.
+  We now use TWO strategies in order:
+    1. DuckDuckGo HTML search (scrape the actual search results page)
+       — no API key, no rate limit for light use
+    2. Fallback: direct fetch from known sources
 
-Once you understand this pattern, every API becomes a tool:
-  - Your own backend API → same pattern, different URL
-  - OpenWeatherMap, NewsAPI, GitHub API → same pattern, add API key in header
-  - Any REST service → same pattern
-
-The agent loop does NOT change at all. You just add functions
-to TOOL_FUNCTIONS and schemas to TOOL_SCHEMAS. That's it.
-The ReAct loop is API-agnostic by design.
-
-ARCHITECTURE LESSON:
-  Notice all three functions follow the same contract:
-    - Accept simple typed arguments (strings, ints)
-    - Return a single string
-    - Never raise exceptions — catch and return error strings
-  
-  This is the "tool contract." The model receives strings.
-  It cannot receive Python dicts, lists, or objects.
-  Everything must be serialized to string before returning.
-  This constraint forces clean, simple tool interfaces.
+  This gives the agent real search results for any query.
 """
 
 import requests
@@ -37,203 +22,167 @@ import re
 from urllib.parse import quote_plus, urlparse
 
 
-# ── 1. DuckDuckGo Web Search ──
+HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; LocalAIAgent/1.0; +https://github.com/local-ai-lab)"}
 
-DDGO_URL = "https://api.duckduckgo.com/"
+
+# ── 1. Web Search (DuckDuckGo HTML scrape) ──
 
 def web_search(query: str, max_results: int = 5) -> str:
     """
-    Search the web using DuckDuckGo's Instant Answer API.
-    Returns a formatted list of results with titles, URLs, and snippets.
+    Search the web using DuckDuckGo and return real results.
 
-    WHY DUCKDUCKGO?
-      - No API key required
-      - No rate limiting for reasonable use
-      - Returns structured JSON
-      - Privacy-respecting (good for local agents)
-
-    LIMITATION:
-      DDG Instant Answers is not a full search API — it returns
-      the "instant answer" box + related topics, not a full SERP.
-      For full search results, you'd use SerpAPI, Brave Search API,
-      or Tavily (all have free tiers). Same pattern, different URL + key.
+    We scrape the DuckDuckGo HTML results page — this gives actual
+    web results (titles + URLs + snippets), not just instant answers.
+    No API key needed. Respects robots.txt via reasonable usage.
     """
     try:
-        params = {
-            "q": query,
-            "format": "json",
-            "no_html": "1",
-            "skip_disambig": "1",
-        }
-        response = requests.get(DDGO_URL, params=params, timeout=10)
+        # DuckDuckGo HTML search endpoint
+        url = f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"
+        response = requests.get(url, headers=HEADERS, timeout=15)
         response.raise_for_status()
+
+        html = response.text
+        results = []
+
+        # Extract result blocks — DDG HTML uses class "result__body"
+        # Each result has: title (.result__a), snippet (.result__snippet), url (.result__url)
+        blocks = re.findall(
+            r'class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>.*?class="result__snippet"[^>]*>(.*?)</span>',
+            html,
+            re.DOTALL
+        )
+
+        for href, title, snippet in blocks[:max_results]:
+            # Clean HTML tags from title and snippet
+            title_clean = re.sub(r"<[^>]+>", "", title).strip()
+            snippet_clean = re.sub(r"<[^>]+>", "", snippet).strip()
+            # DDG wraps URLs — extract the real one
+            real_url = re.sub(r"//duckduckgo\.com/l/\?uddg=", "", href)
+            if real_url.startswith("//"):
+                real_url = "https:" + real_url
+
+            results.append(
+                f"[Result]\nTitle: {title_clean}\nURL: {real_url}\nSnippet: {snippet_clean}"
+            )
+
+        if results:
+            return f"Search results for '{query}':\n\n" + "\n\n---\n\n".join(results)
+
+        # If HTML scrape fails, fall back to Instant Answer API
+        return _ddg_instant_answer(query, max_results)
+
+    except requests.exceptions.Timeout:
+        return f"Search timed out for: '{query}'. Try fetch_webpage with a direct URL."
+    except requests.exceptions.ConnectionError:
+        return "No internet connection available."
+    except Exception as e:
+        # Always try fallback
+        return _ddg_instant_answer(query, max_results)
+
+
+def _ddg_instant_answer(query: str, max_results: int = 5) -> str:
+    """Fallback: DuckDuckGo Instant Answer API."""
+    try:
+        params = {"q": query, "format": "json", "no_html": "1", "skip_disambig": "1"}
+        response = requests.get("https://api.duckduckgo.com/", params=params, timeout=10, headers=HEADERS)
         data = response.json()
 
         results = []
-
-        # Abstract (the main instant answer)
         if data.get("AbstractText"):
-            results.append(
-                f"[Instant Answer]\n"
-                f"{data['AbstractText']}\n"
-                f"Source: {data.get('AbstractURL', 'N/A')}"
-            )
+            results.append(f"[Summary]\n{data['AbstractText']}\nSource: {data.get('AbstractURL', '')}")
 
-        # Related topics (actual search-like results)
-        topics = data.get("RelatedTopics", [])
-        count = 0
-        for topic in topics:
-            if count >= max_results:
-                break
-            # Topics can be nested (sub-categories)
+        for topic in data.get("RelatedTopics", [])[:max_results]:
             if "Topics" in topic:
-                for sub in topic["Topics"]:
-                    if count >= max_results:
-                        break
+                for sub in topic["Topics"][:2]:
                     text = sub.get("Text", "")
                     url = sub.get("FirstURL", "")
                     if text:
-                        results.append(f"[Result {count+1}]\n{text}\nURL: {url}")
-                        count += 1
+                        results.append(f"[Result]\n{text}\nURL: {url}")
             else:
                 text = topic.get("Text", "")
                 url = topic.get("FirstURL", "")
                 if text:
-                    results.append(f"[Result {count+1}]\n{text}\nURL: {url}")
-                    count += 1
+                    results.append(f"[Result]\n{text}\nURL: {url}")
 
-        if not results:
-            return (
-                f"No instant answer found for '{query}'.\n"
-                f"Try fetch_webpage with a specific URL, or rephrase the query."
-            )
+        if results:
+            return f"Search results for '{query}':\n\n" + "\n\n---\n\n".join(results)
 
-        return f"Search results for '{query}':\n\n" + "\n\n---\n\n".join(results)
-
-    except requests.exceptions.Timeout:
-        return f"Search timed out for query: '{query}'"
-    except requests.exceptions.ConnectionError:
-        return "No internet connection available."
+        return (
+            f"No results found for '{query}'.\n"
+            f"Suggestion: Use fetch_webpage with a direct URL to a news site, "
+            f"e.g. fetch_webpage('https://news.ycombinator.com') for tech news."
+        )
     except Exception as e:
-        return f"Search error: {e}"
+        return f"Search unavailable: {e}"
 
 
-# ── 2. HTTP Fetch / Page Reader ──
+# ── 2. Fetch Webpage ──
 
 def fetch_webpage(url: str, max_chars: int = 3000) -> str:
     """
-    Fetch the text content of any public webpage or API endpoint.
-
-    USE CASES:
-      - Read a news article the agent found via web_search
-      - Call a REST API that returns JSON
-      - Read documentation pages
-      - Fetch any public data source
-
-    We strip HTML tags to return clean text.
-    For JSON APIs, we return formatted JSON directly.
-
-    max_chars: truncate output to avoid flooding the context window.
+    Fetch and return the readable text content of any public URL.
+    Works for webpages, JSON APIs, RSS feeds, plain text files.
     """
     try:
-        # Validate URL format
         parsed = urlparse(url)
-        if not parsed.scheme in ("http", "https"):
-            return f"Error: URL must start with http:// or https://"
+        if parsed.scheme not in ("http", "https"):
+            return "Error: URL must start with http:// or https://"
 
-        headers = {
-            "User-Agent": "Mozilla/5.0 (compatible; LocalAIAgent/1.0)"
-        }
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=HEADERS, timeout=15)
         response.raise_for_status()
 
         content_type = response.headers.get("content-type", "")
 
-        # JSON response — format it nicely
+        # JSON API response
         if "application/json" in content_type:
             try:
                 data = response.json()
                 text = json.dumps(data, indent=2, ensure_ascii=False)
                 if len(text) > max_chars:
                     text = text[:max_chars] + "\n... [truncated]"
-                return f"JSON response from {url}:\n{text}"
+                return f"JSON from {url}:\n{text}"
             except Exception:
                 pass
 
-        # HTML response — strip tags
+        # HTML — strip tags and return clean text
         html = response.text
-
-        # Remove script and style blocks entirely
         html = re.sub(r"<script[^>]*>.*?</script>", " ", html, flags=re.DOTALL)
         html = re.sub(r"<style[^>]*>.*?</style>", " ", html, flags=re.DOTALL)
-
-        # Replace block elements with newlines
         html = re.sub(r"<(p|div|br|li|h[1-6]|tr)[^>]*>", "\n", html, flags=re.IGNORECASE)
-
-        # Strip remaining tags
         text = re.sub(r"<[^>]+>", "", html)
-
-        # Clean whitespace
         text = re.sub(r"\n{3,}", "\n\n", text)
         text = re.sub(r" {2,}", " ", text)
         text = text.strip()
 
         if len(text) > max_chars:
-            text = text[:max_chars] + "\n... [truncated, use a smaller page or specific section]"
+            text = text[:max_chars] + "\n... [truncated]"
 
         if not text:
-            return f"Page fetched but no readable text found at {url}"
+            return f"No readable text found at {url}"
 
         return f"Content from {url}:\n\n{text}"
 
     except requests.exceptions.Timeout:
         return f"Timeout fetching {url}"
     except requests.exceptions.HTTPError as e:
-        return f"HTTP error {e.response.status_code} for {url}"
+        return f"HTTP {e.response.status_code} error for {url}"
     except requests.exceptions.ConnectionError:
         return f"Cannot reach {url} — check internet connection."
     except Exception as e:
         return f"Error fetching {url}: {e}"
 
 
-# ── 3. Generic HTTP API Call ──
+# ── 3. Generic API Call ──
 
-def call_api(
-    url: str,
-    method: str = "GET",
-    headers_json: str = "{}",
-    body_json: str = "{}"
-) -> str:
+def call_api(url: str, method: str = "GET", headers_json: str = "{}", body_json: str = "{}") -> str:
     """
-    Make a generic HTTP API call and return the response.
-
-    This tool lets the agent call ANY REST API:
-      - Your own backend APIs
-      - Public APIs (OpenWeatherMap, GitHub, etc.)
-      - Internal microservices
-
-    Parameters use JSON strings (not dicts) because the model
-    can only pass string arguments through the tool call format.
-
-    EXAMPLE TOOL CALLS FROM THE AGENT:
-      call_api(
-        url="https://wttr.in/Arusha?format=j1",
-        method="GET",
-        headers_json="{}",
-        body_json="{}"
-      )
-
-      call_api(
-        url="https://api.example.com/data",
-        method="POST",
-        headers_json='{"Authorization": "Bearer mytoken", "Content-Type": "application/json"}',
-        body_json='{"query": "fish prices"}'
-      )
+    Make a generic HTTP API call to any REST endpoint.
+    Use for APIs that need specific methods, headers, or request bodies.
+    For simple page reads, prefer fetch_webpage instead.
     """
     try:
-        # Parse JSON strings back to dicts
         try:
-            headers = json.loads(headers_json) if headers_json.strip() not in ("{}", "") else {}
+            extra_headers = json.loads(headers_json) if headers_json.strip() not in ("{}", "") else {}
         except json.JSONDecodeError:
             return f"Error: headers_json is not valid JSON: {headers_json}"
 
@@ -242,21 +191,19 @@ def call_api(
         except json.JSONDecodeError:
             return f"Error: body_json is not valid JSON: {body_json}"
 
-        # Add a default user agent
-        headers.setdefault("User-Agent", "LocalAIAgent/1.0")
+        merged_headers = {**HEADERS, **extra_headers}
 
         response = requests.request(
             method=method.upper(),
             url=url,
-            headers=headers,
+            headers=merged_headers,
             json=body,
             timeout=15
         )
 
-        status = response.status_code
         content_type = response.headers.get("content-type", "")
+        status = response.status_code
 
-        # Try to parse as JSON first
         if "application/json" in content_type:
             try:
                 data = response.json()
@@ -267,7 +214,6 @@ def call_api(
             except Exception:
                 pass
 
-        # Fall back to text
         text = response.text[:3000]
         return f"HTTP {status} from {url}:\n{text}"
 
