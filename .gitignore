@@ -66,4 +66,4 @@ logs/
 # Test cache
 .pytest_cache/
 .coverage
-htmlcov/
+htmlcov/.env
